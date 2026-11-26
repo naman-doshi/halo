@@ -7,6 +7,7 @@ from typing import get_args
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from halo.models.fp8_rollout import RolloutWeightPrecision
 from halo.trainers.grpo import online
@@ -17,6 +18,7 @@ from halo.trainers.grpo.rollout.push_parity import PARITY_MAX_MEAN_GAP_NATS, ver
 from halo.weight_sync.clients.vllm import VLLMWeightSyncClient
 from halo.weight_sync.group import WeightSyncGroup
 from halo.weight_sync.pool import WeightSyncPool
+from tests.common.chunked_logprobs import EmbeddingBackboneHarness
 
 _ROW = 1100
 
@@ -187,6 +189,100 @@ def test_the_online_trainer_probes_after_each_push_it_makes(monkeypatch):
 
 def test_every_rollout_weight_precision_has_a_parity_bound():
     assert set(PARITY_MAX_MEAN_GAP_NATS) == set(get_args(RolloutWeightPrecision))
+
+
+class _RealScorerHarness(EmbeddingBackboneHarness):
+    """Real ``ChunkedGRPOLogprobsMixin`` scorer wired for ``verify_first_push_parity``, with scaled head weights so
+    temperature scaling shifts log-probs well past ``PARITY_MAX_MEAN_GAP_NATS['bf16']``."""
+
+    def __init__(self, temperature: float, vocab: int = 40, hidden: int = 8):
+        super().__init__("eager", vocab=vocab, hidden=hidden)
+        with torch.no_grad():
+            self.model.lm_head.weight.mul_(20.0)
+        self.temperature = temperature
+        self._use_chunked_grpo_logprobs = True
+        self.first_push_verified = False
+        self._rollout_weight_precision = "bf16"
+        self.parallelism_config = SimpleNamespace(is_cp_mode=False)
+        self.processing_class = lambda _text: {"input_ids": [i % vocab for i in range(64)]}
+        self.accelerator = SimpleNamespace(device=torch.device("cpu"), is_main_process=True, unwrap_model=lambda m: m)
+        self.args = SimpleNamespace(per_device_train_batch_size=1, per_device_eval_batch_size=1)
+
+    def raw_engine_logps(self, prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
+        ids = torch.tensor([prompt_ids + completion_ids])
+        with torch.no_grad():
+            logits = self.model.lm_head(self.embed(ids)[:, :-1])
+            logps = F.log_softmax(logits[0].float(), dim=-1)
+            return logps[torch.arange(len(completion_ids)), torch.tensor(completion_ids)].tolist()
+
+
+@pytest.mark.parametrize("temperature", [0.7, 1.5])
+def test_non_unit_sampling_temperature_passes_parity_and_restores_temperature(temperature, monkeypatch):
+    monkeypatch.setenv("HALO_WEIGHT_SYNC_PARITY_PROBE", "raise")
+    trainer = _RealScorerHarness(temperature=temperature)
+
+    class _BitIdenticalEngine:
+        def __init__(self):
+            self.scored = []
+
+        def served_max_model_len(self):
+            return None
+
+        def score_completion_logprobs(self, prompt_ids, completion_ids):
+            self.scored.append((prompt_ids, completion_ids))
+            return trainer.raw_engine_logps(prompt_ids, completion_ids)
+
+    engine = _BitIdenticalEngine()
+    # Guard that the fixture's unadjusted temperature gap would actually exceed the parity bound.
+    ids = torch.tensor([trainer.processing_class("")["input_ids"]])
+    with torch.no_grad():
+        scaled_logps, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model, ids, torch.ones_like(ids), ids.size(1) - 1
+        )
+    raw_logps = trainer.raw_engine_logps(ids[0, :1].tolist(), ids[0, 1:].tolist())
+    unadjusted_gap = sum(abs(a - b) for a, b in zip(scaled_logps[0].tolist(), raw_logps, strict=True)) / len(raw_logps)
+    assert unadjusted_gap > PARITY_MAX_MEAN_GAP_NATS["bf16"]
+
+    verify_first_push_parity(trainer, engine)
+
+    assert len(engine.scored) == 1
+    assert trainer.first_push_verified
+    assert trainer.temperature == temperature
+
+
+def test_trainer_temperature_is_restored_when_scoring_raises():
+    seen_temperatures = []
+
+    def failing_logps(_model, _ids, _mask, _logits_to_keep):
+        seen_temperatures.append(trainer.temperature)
+        raise RuntimeError("scoring forward failed")
+
+    trainer = _trainer()
+    trainer.temperature = 0.7
+    trainer._get_per_token_logps_and_entropies = failing_logps
+
+    with pytest.raises(RuntimeError, match="scoring forward failed"):
+        verify_first_push_parity(trainer, _Engine())
+
+    assert seen_temperatures == [1.0]
+    assert trainer.temperature == 0.7
+
+
+def test_trainer_without_temperature_attribute_is_left_untouched():
+    had_temperature = []
+
+    def check_logps(_model, ids, _mask, logits_to_keep):
+        had_temperature.append(hasattr(trainer, "temperature"))
+        assert ids.shape == (1, logits_to_keep + 1)
+        return torch.full((1, logits_to_keep), -2.0), None, None
+
+    trainer = _trainer()
+    trainer._get_per_token_logps_and_entropies = check_logps
+
+    verify_first_push_parity(trainer, _Engine())
+
+    assert had_temperature == [False]
+    assert not hasattr(trainer, "temperature")
 
 
 if __name__ == "__main__":

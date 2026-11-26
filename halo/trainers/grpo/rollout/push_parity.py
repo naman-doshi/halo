@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # on Qwen3.5-35B-A3B), and the bound grows with it.
 _FP8_BLOCK_GAP_GROWTH = 1.5
 PARITY_MAX_MEAN_GAP_NATS: dict[RolloutWeightPrecision, float] = {"bf16": 1.0, "fp8_block": 1.0 * _FP8_BLOCK_GAP_GROWTH}
+_MISSING = object()
 
 
 def _scoring_client(client):
@@ -32,12 +33,21 @@ def _scoring_client(client):
 
 def _trainer_logps(trainer, token_ids: list[int]) -> list[float]:
     """COLLECTIVE: every rank scores the same row. Log-probs of ``token_ids[1:]`` given the first token, in the model's
-    current train/eval mode, as the loss path's own recomputation runs."""
+    current train/eval mode and at temperature 1.0 so they match the engine's raw pre-sampler prefill log-probs."""
     ids = torch.tensor([token_ids], device=trainer.accelerator.device)
-    with torch.no_grad():
-        logps, _entropies, _aux = trainer._get_per_token_logps_and_entropies(
-            trainer.model, ids, torch.ones_like(ids), len(token_ids) - 1
-        )
+    # ``score_completion_logprobs`` returns raw (T = 1.0) pre-sampler log-probs, while Halo's chunked scorer and TRL's
+    # full-logits scorer both divide logits by ``trainer.temperature``.
+    saved_temperature = getattr(trainer, "temperature", _MISSING)
+    if saved_temperature is not _MISSING:
+        trainer.temperature = 1.0
+    try:
+        with torch.no_grad():
+            logps, _entropies, _aux = trainer._get_per_token_logps_and_entropies(
+                trainer.model, ids, torch.ones_like(ids), len(token_ids) - 1
+            )
+    finally:
+        if saved_temperature is not _MISSING:
+            trainer.temperature = saved_temperature
     return logps[0].float().cpu().tolist()
 
 
