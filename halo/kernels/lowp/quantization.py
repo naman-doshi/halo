@@ -234,10 +234,14 @@ def nvfp4_global_scale(amax: torch.Tensor) -> torch.Tensor:
 
 def _nvfp4_core(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``blocks`` → (e2m1 code uint8, ``e4m3`` scale, per-tensor fp32 global scale from :func:`nvfp4_global_scale`)."""
-    global_scale = nvfp4_global_scale(blocks.abs().amax())
+    tensor_amax = blocks.abs().amax() if blocks.numel() else blocks.new_zeros(())
+    global_scale = nvfp4_global_scale(tensor_amax)
     amax = blocks.abs().amax(dim=-1, keepdim=True)
+    # Under flushed denormals, a tiny or all-zero tensor flushes global_scale to 0; guard the divide against 0/0 = NaN
+    # without altering unflushed arithmetic, where nvfp4_global_scale is strictly positive.
+    global_divisor = global_scale.masked_fill(global_scale == 0, 1.0)
     # Redundant in exact arithmetic; keeps fp rounding from pushing the scale past e4m3's range (NaN).
-    scale = (amax / _ELEMENT_MAX["nvfp4"] / global_scale).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
+    scale = (amax / _ELEMENT_MAX["nvfp4"] / global_divisor).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
     code = _e2m1_codes(blocks, scale.float() * global_scale)
     return code, scale, global_scale
 

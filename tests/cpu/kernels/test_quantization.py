@@ -207,7 +207,7 @@ def _with_zero_blocks() -> torch.Tensor:
     return w
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 def test_an_all_zero_block_round_trips_to_zero_under_flushed_denormals(fmt):
     """The block's exponent clamps to -127, and exp2(-127) is a subnormal a flushing graph turns into 0: dividing by it
     gave 0/0 = NaN for mxfp8 (1024 NaNs on this tensor). Under the flush the round trip has no NaN, the block is
@@ -219,6 +219,109 @@ def test_an_all_zero_block_round_trips_to_zero_under_flushed_denormals(fmt):
     assert not flushed.isnan().any()
     assert torch.equal(flushed[1, :32, :], torch.zeros(32, 32, dtype=flushed.dtype))
     assert torch.equal(flushed, unflushed)
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+def test_an_all_zero_tensor_round_trips_to_zero_under_flushed_denormals(fmt):
+    """Unlike a tensor with one zero block, an all-zero tensor flushes nvfp4's global scale (2^-137) itself to 0, so
+    unguarded ``amax / 6 / global_scale`` gave 0/0 = NaN across the whole tensor."""
+    x = torch.zeros(4, 64, dtype=torch.bfloat16)
+    unflushed = quantization._block_round_trip(x, fmt, -1)
+    with _flushed_denormals():
+        flushed = quantization._block_round_trip(x, fmt, -1)
+    assert torch.isfinite(flushed).all()
+    assert flushed.abs().max().item() == 0.0
+    assert torch.equal(flushed, unflushed)
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        pytest.param(torch.full((4, 64), 1e-36), id="1e-36"),
+        pytest.param(torch.full((4, 64), 3e-38), id="3e-38"),
+        pytest.param(torch.cat([torch.full((2, 64), 2e-35), torch.zeros(2, 64)]), id="2e-35_with_zero_blocks"),
+    ],
+)
+def test_tiny_nvfp4_tensors_round_trip_to_finite_zero_under_flushed_denormals(x):
+    """Any tensor amax below ``2688 * 2^-126`` (~3.16e-35) flushes ``amax / 2688`` to 0 under FTZ, making
+    ``global_scale = 0``; every block must still stay finite with no NaN or inf."""
+    with _flushed_denormals():
+        q = quantize_nvfp4(x, axis=-1)
+        recon = dequantize(q)
+    assert torch.isfinite(recon).all()
+    assert recon.abs().max().item() == 0.0
+    assert torch.isfinite(q.scales.float()).all()
+    assert torch.isfinite(q.global_scale).all()
+
+
+def test_nvfp4_unflushed_all_zero_keeps_subnormal_global_scale():
+    """Unflushed arithmetic keeps ``nvfp4_global_scale(0) == 2^-137``, preserving Triton parity and the exporter's
+    ``global_scale.reciprocal() == inf`` detection for all-zero weights."""
+    q = quantize_nvfp4(torch.zeros(4, 64), axis=-1)
+    assert q.global_scale.item() == 2.0**-137
+    assert (q.data == 0).all()
+    assert (q.scales.float() == 0.0).all()
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize(
+    ("shape", "axis"),
+    [
+        ((0, 64), -1),
+        ((4, 0), -1),
+        ((0, 0), -1),
+        ((0, 64), 0),
+        ((0, 3), 0),
+        ((0, 17), 0),
+        ((2, 0, 32), -1),
+        ((0, 2, 32), -1),
+        ((2, 0, 16), 1),
+    ],
+)
+def test_empty_tensor_round_trip_and_ste_backward(fmt, shape, axis):
+    """Empty activations (such as an EP rank with 0 local tokens) must round-trip and pass the STE backward cleanly."""
+    block_size = quantization.FORMAT_BLOCK_SIZE[fmt]
+    norm_axis = axis % len(shape)
+    t = torch.empty(shape, dtype=torch.bfloat16)
+
+    q = quantization.QUANTIZERS[fmt](t, axis=axis)
+    expected_data_shape = list(shape)
+    if q.packed:
+        expected_data_shape[norm_axis] //= 2
+    expected_scale_shape = list(shape)
+    expected_scale_shape[norm_axis] //= block_size
+    assert q.data.shape == tuple(expected_data_shape)
+    assert q.scales.shape == tuple(expected_scale_shape)
+    if fmt == "nvfp4":
+        assert q.global_scale is not None and q.global_scale.shape == () and q.global_scale.dtype == torch.float32
+        assert torch.isfinite(q.global_scale).all()
+    else:
+        assert q.global_scale is None
+
+    recon = dequantize(q)
+    assert recon.shape == shape and recon.dtype == torch.bfloat16
+
+    x = torch.empty(shape, dtype=torch.bfloat16, requires_grad=True)
+    y = fake_quant(x, fmt, axis=axis)
+    assert y.shape == shape and y.dtype == torch.bfloat16
+    y.sum().backward()
+    assert x.grad is not None and x.grad.shape == shape and x.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("shape", [(2, 0, 16), (0, 2, 16)])
+def test_empty_nvfp4_16_wide_3d_round_trip(shape):
+    x = torch.empty(shape, dtype=torch.bfloat16, requires_grad=True)
+    y = fake_quant(x, "nvfp4", axis=-1)
+    assert y.shape == shape and y.dtype == torch.bfloat16
+    y.sum().backward()
+    assert x.grad is not None and x.grad.shape == shape and x.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("shape", [(0, 3), (0, 17)])
+def test_empty_tensor_with_non_divisible_blocked_axis_still_raises(fmt, shape):
+    with pytest.raises(ValueError, match="not divisible"):
+        quantization.QUANTIZERS[fmt](torch.empty(shape), axis=-1)
 
 
 def _block_at_exponent(fmt: str, edge: str) -> torch.Tensor:
