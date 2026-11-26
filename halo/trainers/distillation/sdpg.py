@@ -13,7 +13,13 @@ from halo.model_loading.dtype import resolve_training_dtype
 from halo.model_loading.tokenizer_setup import resolve_tokenizer
 from halo.trainers.distillation.divergences import pooled_token_mean, projected_divergence, token_divergence
 from halo.trainers.distillation.opd_term import OPDTermMixin, privileged_teacher_pass
-from halo.trainers.grpo.logprob_scoring import FULL_LOGITS_BYTES_PER_LOGIT, CompletionTerm, HeadSweep
+from halo.trainers.grpo.logprob_scoring import (
+    FULL_LOGITS_BYTES_PER_LOGIT,
+    CompletionTerm,
+    HeadSweep,
+    _completion_window,
+    rows_forward_densely,
+)
 from halo.trainers.grpo.online import DistributedOnlineGRPOTrainer
 from halo.trainers.grpo.rounds.rank_balance import PROMPT_ROWS
 from halo.trainers.loop.evaluation import split_rows_head
@@ -173,9 +179,14 @@ class DistributedSDPGTrainer(OPDTermMixin, StoredMetricsMixin, DistributedOnline
         teacher_hidden = None
         if self._use_chunked_grpo_logprobs:
             unwrapped = self.accelerator.unwrap_model(model)
+            # Resolved before privileged_teacher_pass switches model to eval, matching the student's mode-based bound.
+            batch_size = (
+                self.args.per_device_train_batch_size if self.model.training else self.args.per_device_eval_batch_size
+            ) or prefix[0].size(0)
+            dense = rows_forward_densely(unwrapped, batch_size)
             with privileged_teacher_pass(model):
                 teacher_hidden = self._chunked_forward_redirection(
-                    model, unwrapped, self._teacher_hidden_states, unwrapped, *prefix, *completion
+                    model, unwrapped, self._teacher_hidden_states, unwrapped, *prefix, *completion, dense
                 )
         # The GRPO loss forward hands the student's completion rows to the term, so the student runs forward and
         # backward once.
@@ -238,16 +249,19 @@ class DistributedSDPGTrainer(OPDTermMixin, StoredMetricsMixin, DistributedOnline
             vocab=head.width,
         )
 
-    def _teacher_hidden_states(self, unwrapped_model, prefix_ids, prefix_mask, completion_ids, completion_mask):
+    def _teacher_hidden_states(
+        self, unwrapped_model, prefix_ids, prefix_mask, completion_ids, completion_mask, dense: bool = False
+    ):
         """``[B, C, H]`` at the positions predicting the completion, run inside the redirected forward where FSDP2 has
         gathered the root parameters. The head is applied inside the GRPO loss forward, at the positions the gate
-        keeps."""
-        return self._backbone_hidden_state(
-            unwrapped_model,
-            torch.cat([prefix_ids, completion_ids], dim=1),
-            torch.cat([prefix_mask, completion_mask], dim=1),
-            completion_ids.size(1),
-        )
+        keeps. Under ``dense``, each row trims its pads and forwards alone, matching the student's dense scorer."""
+        input_ids = torch.cat([prefix_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prefix_mask, completion_mask], dim=1)
+        completion_width = completion_ids.size(1)
+        if not dense:
+            return self._backbone_hidden_state(unwrapped_model, input_ids, attention_mask, completion_width)
+        hidden, widths = self._dense_last_hidden_state(unwrapped_model, input_ids, attention_mask, completion_width)
+        return _completion_window(hidden.split(widths), completion_width)
 
     def _completion_logits(self, model, prefix_ids, prefix_mask, completion_ids, completion_mask):
         """``[B, C, V]``. Where the forward takes ``logits_to_keep`` the prompt's rows are never built. The prefixes

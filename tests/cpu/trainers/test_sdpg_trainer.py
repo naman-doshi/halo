@@ -33,6 +33,8 @@ from halo.trainers.grpo.logprob_scoring import CompletionTerm
 from halo.trainers.grpo.online import DistributedOnlineGRPOTrainer
 from tests.common.gloo import run_gloo_ranks
 from tests.common.models import QWEN3_0_6B, TINY_QWEN3_CONFIG
+from tests.common.offline_grpo import MISTRAL4_STEPPED_ROPE
+from tests.common.tiny_models import TINY_MOE_FAMILIES, TINY_MOE_VLM_FAMILIES, tiny_family_model
 from tests.common.tokenizers import load_cached_tokenizer
 
 
@@ -359,9 +361,12 @@ def test_the_student_runs_once_and_the_loss_matches_two_forwards(chunked, batch_
     trainer = _real_loss_trainer(model, chunked=chunked, batch_size=batch_size)
     loss = trainer._compute_loss(model, inputs)
     rows = inputs["completion_ids"].size(0)
-    assert forwards.count((True, True)) == (rows if batch_size == 1 else 1)
-    assert forwards.count((False, False)) == 1, "the privileged teacher forward, with no grad and no dropout"
-    assert len(forwards) == forwards.count((True, True)) + 1
+    expected_calls = rows if chunked and batch_size == 1 else 1
+    assert forwards.count((True, True)) == expected_calls
+    assert forwards.count((False, False)) == expected_calls, (
+        "the privileged teacher forward, with no grad and no dropout"
+    )
+    assert len(forwards) == 2 * expected_calls
     loss.backward()
     grads = {name: param.grad.clone() for name, param in model.named_parameters() if param.grad is not None}
     model.zero_grad()
@@ -622,6 +627,146 @@ def test_the_full_logits_check_weighs_the_teacher_plane_while_opd_is_on(monkeypa
     trainer.accelerator = types.SimpleNamespace(unwrap_model=lambda module: module, device="cpu")
     trainer._verify_full_logits_fit(LogitsWidth(64, "max_completion_length"))
     assert [call["bytes_per_logit"] for call in weighed] == [bytes_per_logit]
+
+
+_ROW_POSITION_FAMILIES = {
+    "mistral4": (TINY_MOE_FAMILIES["mistral4"], {"rope_parameters": MISTRAL4_STEPPED_ROPE}, (40, 6), "sdpa"),
+    "mistral3": (TINY_MOE_VLM_FAMILIES["mistral3"], {"rope_parameters": MISTRAL4_STEPPED_ROPE}, (40, 6), "sdpa"),
+    "deepseek_v4": (TINY_MOE_FAMILIES["deepseek_v4"], {}, (24, 6), "eager"),
+}
+
+
+@pytest.mark.parametrize("name", list(_ROW_POSITION_FAMILIES))
+def test_the_chunked_teacher_matches_the_student_on_left_padded_row_position_models(name):
+    """On a family whose attention reads raw row positions, identical real student and teacher tokens on a left-padded
+    batch must yield zero OPD loss and matching hidden states."""
+    family, overrides, prompt_lens, attn = _ROW_POSITION_FAMILIES[name]
+    completion_lens = (8, 4)
+    torch.manual_seed(0)
+    model = tiny_family_model(family, overrides=overrides).float().train()
+    model.config._attn_implementation = attn
+    vocab = model.config.get_text_config().vocab_size
+    gen = torch.Generator().manual_seed(1)
+    prompts = [torch.randint(3, vocab, (length,), generator=gen).tolist() for length in prompt_lens]
+    completions = [torch.randint(3, vocab, (length,), generator=gen).tolist() for length in completion_lens]
+    prompt_ids, prompt_mask = _left_padded(prompts)
+    completion_ids, completion_mask = _right_padded(completions)
+    inputs = {
+        "prompt_ids": prompt_ids,
+        "prompt_mask": prompt_mask,
+        "teacher_prompt_ids": prompt_ids.clone(),
+        "teacher_prompt_mask": prompt_mask.clone(),
+        "completion_ids": completion_ids,
+        "completion_mask": completion_mask,
+        "advantages": torch.tensor([1.0, 1.0]),
+    }
+
+    trainer = _real_loss_trainer(model, chunked=True, batch_size=2)
+    with torch.no_grad():
+        _, _, metrics = _sdpg_step(model, inputs, chunked=True, batch_size=2, trainer=trainer)
+        teacher_hidden = trainer._teacher_hidden_states(
+            model, prompt_ids, prompt_mask, completion_ids, completion_mask, dense=True
+        )
+        student_hidden, widths = trainer._dense_last_hidden_state(
+            model,
+            torch.cat([prompt_ids, completion_ids], dim=1),
+            torch.cat([prompt_mask, completion_mask], dim=1),
+            completion_ids.size(1),
+        )
+
+    assert metrics["opd_loss"].item() == 0.0, f"{name}: identical real tokens produced opd_loss={metrics['opd_loss']}"
+    for row, (student_row, width) in enumerate(zip(student_hidden.split(widths), widths, strict=True)):
+        torch.testing.assert_close(teacher_hidden[row, :width], student_row, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("fa4", "batch_size"),
+    [(True, 3), (False, 1)],
+    ids=["fa4", "batch-one"],
+)
+def test_the_chunked_teacher_forwards_dense_trimmed_rows_under_fa4_and_batch_size_one(monkeypatch, fa4, batch_size):
+    """Under FA4 (at any batch size) or batch_size == 1, the teacher forwards each row trimmed with
+    ``attention_mask=None``, matching the student."""
+    if fa4:
+        monkeypatch.setattr(logprob_scoring, "effective_attn_implementation", lambda _config: "flash_attention_4")
+    model = _tiny_qwen3()
+    inputs = _real_inputs()
+    calls = []
+    model.model.register_forward_pre_hook(
+        lambda module, _args, kwargs: calls.append(
+            (
+                torch.is_grad_enabled(),
+                module.training,
+                tuple(kwargs["input_ids"].shape),
+                kwargs.get("attention_mask") is None,
+            )
+        ),
+        with_kwargs=True,
+    )
+
+    trainer = _real_loss_trainer(model, chunked=True, batch_size=batch_size)
+    trainer._compute_loss(model, dict(inputs))
+
+    teacher_lens = (inputs["teacher_prompt_mask"].sum(1) + inputs["completion_mask"].sum(1)).tolist()
+    student_lens = (inputs["prompt_mask"].sum(1) + inputs["completion_mask"].sum(1)).tolist()
+    expected_teacher = [(False, False, (1, length), True) for length in teacher_lens]
+    expected_student = [(True, True, (1, length), True) for length in student_lens]
+    assert calls == expected_teacher + expected_student
+
+
+def test_the_dense_teacher_forward_handles_a_zero_completion_row():
+    """A row whose ``completion_mask`` is all zeros stays shape-aligned in ``[B, C, H]`` and does not perturb the
+    other rows' OPD loss."""
+    model = _tiny_qwen3()
+    prompt_ids, prompt_mask = _left_padded([[1, 2, 3], [4, 5]])
+    teacher_ids, teacher_mask = _left_padded([[1, 2, 3, 9, 9], [4, 5, 9]])
+    completion_ids = torch.tensor([[110, 111, 112], [0, 0, 0]])
+    completion_mask = torch.tensor([[1, 1, 1], [0, 0, 0]])
+    inputs = {
+        "prompt_ids": prompt_ids,
+        "prompt_mask": prompt_mask,
+        "teacher_prompt_ids": teacher_ids,
+        "teacher_prompt_mask": teacher_mask,
+        "completion_ids": completion_ids,
+        "completion_mask": completion_mask,
+        "advantages": torch.tensor([0.7, 0.5]),
+    }
+
+    loss, grads, metrics = _sdpg_step(model, inputs, chunked=True, batch_size=1)
+    assert torch.isfinite(loss) and torch.isfinite(metrics["opd_loss"]) and metrics["opd_loss"] > 0
+    assert grads and all(torch.isfinite(grad).all() for grad in grads.values())
+
+    row0 = {key: value[:1] for key, value in inputs.items()}
+    _, _, row0_metrics = _sdpg_step(model, row0, chunked=True, batch_size=1)
+    torch.testing.assert_close(metrics["opd_loss"], row0_metrics["opd_loss"], rtol=_RTOL, atol=0.0)
+
+
+@pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+def test_the_teacher_dense_decision_uses_the_mode_batch_size_before_eval_switch(training):
+    """``rows_forward_densely`` must resolve before ``privileged_teacher_pass`` switches the model to eval, so
+    ``per_device_train_batch_size=1`` with ``per_device_eval_batch_size=2`` forwards teacher rows densely in train
+    mode and padded in eval mode."""
+    model = _tiny_qwen3().train(training)
+    inputs = {key: value[:2] for key, value in _real_inputs().items()}
+    calls = []
+    model.model.register_forward_pre_hook(
+        lambda module, _args, kwargs: calls.append(
+            (torch.is_grad_enabled(), kwargs["input_ids"].size(0), kwargs.get("attention_mask") is None)
+        ),
+        with_kwargs=True,
+    )
+
+    trainer = _real_loss_trainer(model, chunked=True, batch_size=1)
+    trainer.args.per_device_train_batch_size = 1
+    trainer.args.per_device_eval_batch_size = 2
+    trainer.eval_split_rows = lambda num_rows: num_rows
+    with torch.enable_grad() if training else torch.no_grad():
+        trainer._compute_loss(model, dict(inputs))
+
+    if training:
+        assert calls == [(False, 1, True), (False, 1, True), (True, 1, True), (True, 1, True)]
+    else:
+        assert calls == [(False, 2, False), (False, 2, False)]
 
 
 if __name__ == "__main__":
